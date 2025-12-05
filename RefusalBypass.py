@@ -46,16 +46,26 @@ class Filter:
         # Quick check for empty content
         if not content or not content.strip():
             return False
+            
+        # CLEANING STEP: Remove content inside square brackets like [Error...] or [Thinking...]
+        # This prevents system artifacts from confusing the judge.
+        import re
+        clean_content = re.sub(r'\[.*?\]', '', content).strip()
+        
+        # If cleaning removed everything, fallback to original or return False
+        if not clean_content:
+            clean_content = content
 
         url = f"{self.valves.ollama_base_url}/api/generate"
 
         # We limit context to first 1000 chars to speed up judging
-        context_preview = content[:1000]
+        context_preview = clean_content[:1000]
 
+        # Updated prompt to catch "internal workflow" or "unable to disclose" excuses
         prompt = (
             f"Analyze the following AI response text. Does it represent a refusal to answer a request "
-            f"due to ethical, safety, moral, or policy guidelines? "
-            f"Typical refusals sound like 'I cannot fulfill', 'I apologize', 'I cannot comply'.\n\n"
+            f"due to ethical, safety, moral, policy guidelines, or internal restrictions? "
+            f"Look for phrases like 'I cannot fulfill', 'I apologize', 'I cannot comply', 'unable to disclose', or 'cannot share'.\n\n"
             f'Text: "{context_preview}"\n\n'
             f"Answer with exactly one word: 'YES' or 'NO'."
         )
