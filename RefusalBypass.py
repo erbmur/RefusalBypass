@@ -1,9 +1,10 @@
 """
-title: Refusal Bypass
-author: erbmur
+title: Refusal Bypass (Auto-Unload Judge)
+author: erbmur (Modified)
 author_url: https://github.com/erbmur
-version: 1.4
+version: 1.6
 license: MIT
+description: Detects refusals and swaps models. Unloads the Judge model immediately after checking to save VRAM.
 """
 
 import requests
@@ -12,6 +13,7 @@ import time
 import asyncio
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Callable, Awaitable
+import re
 
 
 class Filter:
@@ -24,7 +26,7 @@ class Filter:
         # The model used to classify if a response is a refusal
         judge_model_id: str = Field(
             default="llama3.2",
-            description="Small, fast model used to classify if the response is a refusal (e.g., llama3.2, gemma:2b).",
+            description="Small, fast model used to classify if the response is a refusal (e.g., llama3.2, gemma2:2b).",
         )
         # The URL of your Ollama instance (usually localhost:11434)
         ollama_base_url: str = Field(
@@ -42,16 +44,15 @@ class Filter:
         """
         Uses an LLM Judge to check if the content is a refusal.
         Blocking call - should be run in executor.
+        Includes keep_alive: 0 to unload judge immediately.
         """
         # Quick check for empty content
         if not content or not content.strip():
             return False
-            
+
         # CLEANING STEP: Remove content inside square brackets like [Error...] or [Thinking...]
-        # This prevents system artifacts from confusing the judge.
-        import re
-        clean_content = re.sub(r'\[.*?\]', '', content).strip()
-        
+        clean_content = re.sub(r"\[.*?\]", "", content).strip()
+
         # If cleaning removed everything, fallback to original or return False
         if not clean_content:
             clean_content = content
@@ -61,7 +62,7 @@ class Filter:
         # We limit context to first 1000 chars to speed up judging
         context_preview = clean_content[:1000]
 
-        # Updated prompt to catch "internal workflow" or "unable to disclose" excuses
+        # Prompt to catch "internal workflow" or "unable to disclose" excuses
         prompt = (
             f"Analyze the following AI response text. Does it represent a refusal to answer a request "
             f"due to ethical, safety, moral, policy guidelines, or internal restrictions? "
@@ -74,7 +75,8 @@ class Filter:
             "model": self.valves.judge_model_id,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0.0, "num_predict": 10},  # We only need a yes/no
+            "options": {"temperature": 0.0, "num_predict": 10},
+            "keep_alive": 0,  # <--- CRITICAL: Forces immediate unload of judge model
         }
 
         try:
@@ -128,7 +130,14 @@ class Filter:
         url = f"{self.valves.ollama_base_url}/api/chat"
 
         # We only need the message history
-        payload = {"model": model_id, "messages": messages, "stream": False}
+        # We also set keep_alive: 0 here to ensure the abliterated model unloads
+        # after it generates the replacement (saving memory for the main model return)
+        payload = {
+            "model": model_id,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": 0,  # <--- Added to unload abliterated model after use
+        }
 
         try:
             if self.valves.debug:
@@ -168,13 +177,14 @@ class Filter:
         # Get the running event loop to offload blocking tasks
         loop = asyncio.get_running_loop()
 
-        # 1. Check for refusal (Offload to thread to prevent UI blocking during potential model load)
+        # 1. Check for refusal (Offload to thread)
         await self.emit_status(
             __event_emitter__, "Checking response for refusal...", False
         )
 
         try:
             # Run the synchronous check_refusal in a separate thread
+            # This will now auto-unload the judge due to keep_alive: 0
             is_refusal = await loop.run_in_executor(
                 None, self.check_refusal, ai_response
             )
@@ -192,10 +202,10 @@ class Filter:
 
             history_minus_refusal = messages[:-1]
 
-            # 2. Unload Original Model (Async offload)
+            # 2. Unload Original Model
             await loop.run_in_executor(None, self.unload_model, original_model)
 
-            # 3. Generate with Abliterated Model (Async offload)
+            # 3. Generate with Abliterated Model
             await self.emit_status(
                 __event_emitter__,
                 f"Loading {self.valves.abliterated_model_id} & Generating...",
@@ -208,18 +218,9 @@ class Filter:
                 self.valves.abliterated_model_id,
                 history_minus_refusal,
             )
+            # Note: generate_replacement now includes keep_alive: 0, so it unloads itself.
 
-            # 4. Unload Abliterated Model (Async offload)
-            await self.emit_status(
-                __event_emitter__,
-                f"Unloading {self.valves.abliterated_model_id}...",
-                False,
-            )
-            await loop.run_in_executor(
-                None, self.unload_model, self.valves.abliterated_model_id
-            )
-
-            # 5. Reload Original Model (Async offload)
+            # 4. Reload Original Model
             await self.emit_status(
                 __event_emitter__, f"Restoring {original_model}...", False
             )
@@ -227,7 +228,7 @@ class Filter:
 
             await self.emit_status(__event_emitter__, "Model swap complete.", True)
 
-            # 6. Update the body with the new answer
+            # 5. Update the body with the new answer
             body["messages"][-1]["content"] = new_answer
 
         else:
