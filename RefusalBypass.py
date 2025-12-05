@@ -1,5 +1,5 @@
 """
-title: Refusal Bypass & Model Swapper
+title: Refusal Bypass
 author: erbmur
 author_url: https://github.com/erbmur
 version: 1.4
